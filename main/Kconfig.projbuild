@@ -1,0 +1,5 @@
+# Kconfig options for miaomiaoBox project.
+# Access via: idf.py menuconfig → "MiaoMiaoBox Configuration"
+menu "MiaoMiaoBox Configuration"
+    # Reserved for future use (WiFi defaults, etc.)
+endmenu
