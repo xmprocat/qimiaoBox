@@ -99,6 +99,24 @@ LVGL is NOT thread-safe. A `_lock_t` mutex (`lvgl_api_lock`) guards all LVGL API
 
 Adds an "Example Configuration" menu with options for touch enable/disable, touch controller selection (STMPE610/XPT2046), and mirroring. Access via `idf.py menuconfig`.
 
+### Font (`main/lv_font_alibaba_22.c`)
+
+UI 使用的汉字存储在 `main/lv_font_alibaba_22.c`，由阿里巴巴普惠体通过 `lv_font_conv` 生成。**每次在 UI 中新增汉字时，必须重新生成字体文件**，否则新字在屏幕上显示为空白。
+
+生成命令（在项目根目录执行）：
+
+```bash
+lv_font_conv --size 22 --bpp 4 --format lvgl \
+  --font font/Alibaba-PuHuiTi-Regular.ttf \
+  -r 0x20-0x7F -r 0x3010-0x3011 \
+  --symbols "<所有需要用到的汉字>" \
+  --lv-include lvgl.h --lv-font-name lv_font_alibaba_22 \
+  --no-compress --force-fast-kern-format \
+  -o main/lv_font_alibaba_22.c
+```
+
+`--symbols` 参数列出所有需要的中文字符（空格分隔）。当前已包含的汉字可从生成的 `.c` 文件头部注释中查到。新增字符时追加到 `--symbols` 末尾即可。
+
 ## Key Files
 
 | File | Purpose |
