@@ -1,3 +1,4 @@
 dependencies:
   lvgl/lvgl: 9.3.0
   espressif/button: ">=4.0,<5.0"
+  espressif/cjson: "^1.7.19~2"

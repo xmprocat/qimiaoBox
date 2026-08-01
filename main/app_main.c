@@ -175,8 +175,8 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_err);
     ESP_LOGI(TAG, "NVS initialized");
 
-    /* ---- Console (USB: async probe; UART: immediate) ---- */
-    console_init("miao>");
+    /* ---- Console (USB async probe) ---- */
+    console_init();
 
     ESP_LOGI(TAG, "Initialize SPI bus");
     spi_bus_config_t buscfg = {
@@ -310,4 +310,7 @@ void app_main(void)
     _lock_acquire(&lvgl_api_lock);
     miaobox_ui(display);
     _lock_release(&lvgl_api_lock);
+
+    /* ---- Console phase 2: start REPL after all HW/WiFi init is done ---- */
+    console_start_repl("miao>");
 }

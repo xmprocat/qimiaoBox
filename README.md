@@ -41,10 +41,25 @@ VS Code 配置见 `.vscode/settings.json`（目标 `esp32c6`，端口 `COM21`，
 | 页面 | 描述 | 进入方式 |
 |------|------|----------|
 | Splash | "淇喵盒子" + 构建时间，1s | 启动 |
-| Key Test | 四色方框对应按键，按下变色 | splash 后自动 |
-| Birthday | 生日倒计时，4行逐行淡入 | key_test 长按 ESC（需 NTP 同步） |
-| Time Sync | WiFi 扫描 + NTP 多服务器轮询 | key_test 长按 ESC（未同步时） |
-| Heart | 500 粒子从边缘飞向心形轮廓 | birthday 短按 DOWN |
+| Main Menu | 横向滚动菜单，6 项缩放动画 | splash 后自动 |
+| Key Test | 四色方框对应按键，按下变色 | 主菜单选择"调试" |
+| Birthday | 生日倒计时，4行逐行淡入 | 主菜单选择"淇"（需 NTP 同步） |
+| Time Sync | WiFi 扫描 + NTP 多服务器轮询 | 进入 birthday 时自动（未同步） |
+| Heart | 500 粒子从边缘飞向心形轮廓 | 主菜单选择"保留1" |
+| Settings | 暗色调面板，switch/dropdown/action 控件 | 主菜单选择"设置" |
+| Cat Download | WiFi→AI画图→下载写入Flash，逐步状态提示 | 主菜单选择"喵" |
+| Cat Display | PNGdec 逐行解码显示猫猫图片 | 下载成功后自动跳转 |
+
+### 菜单
+
+| 菜单项 | 目标页 | 图标 |
+|--------|--------|------|
+| 设置 | Settings | 齿轮图标 |
+| 淇 | Birthday | 56px 大字 |
+| 喵 | Cat Download | 56px 大字 |
+| 保留1 | Heart | 默认占位 |
+| 保留2 | Cat Display | 默认占位 |
+| 调试 | Key Test | 扳手图标 |
 
 ### 控制台命令
 
@@ -72,19 +87,25 @@ WiFi 凭据支持多组 (wifi.ssid.{1-5})，连接前先扫描周围 AP 取第�
 | ESP-IDF | 6.0.1 |
 | LVGL | 9.3.0 |
 | espressif/button | 4.2.0 |
+| espressif/cjson | 1.0.0 |
+| PNGdec (内置) | 5.0 |
 
 ## 项目结构
 
 ```
 main/
   app_main.c         硬件初始化 + 主入口
-  miaobox_ui.c       LVGL UI (4 页面 + splash)
-  miaobox_net.c      WiFi 扫描匹配 + NTP 同步
-  miaobox_console.c  控制台 (USB Serial JTAG, 异步探测)
-  miaobox_cmd.c      控制台命令 (setcfg/getcfg/delcfg/reboot/factoryreset)
+  miaobox_ui.c       LVGL UI (9 页面 + splash)
+  miaobox_net.c      WiFi 扫描匹配 + 共享连接
+  miaobox_ai.c       AI 猫猫画图 (HTTP API + Flash 存储)
+  miaobox_console.c  控制台 (USB Serial JTAG, 两阶段初始化)
+  miaobox_cmd.c      控制台命令 (setcfg/getcfg/delcfg/reboot)
   lv_font_alibaba_22.c  字体 (阿里巴巴普惠体 22px)
+  lv_font_alibaba_56.c  字体 (阿里巴巴普惠体 56px)
+  pngdec/            PNGdec 轻量 PNG 解码器
 font/
   Alibaba-PuHuiTi-Regular.ttf  源字体
+partitions.csv       分区表 (factory + nvs + storage)
 ```
 
 ## 许可

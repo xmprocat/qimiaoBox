@@ -2,21 +2,13 @@
  * miaobox_console.c — 控制台初始化 (USB Serial JTAG / UART)
  * ==========================================================
  *
- * USB Serial JTAG 异步探测:
- *   console_init() → 启动 usb_probe_task (后台)
- *   usb_probe_task: 每200ms读 SOF 帧计数器
- *     → 检测到USB host → 初始化 driver + linenoise + REPL task
- *     → 30次(6s)未检测到 → 退出，日志走 ROM 默认非阻塞输出
+ * 两阶段初始化:
+ *   console_init():         启动USB探测任务（后台）
+ *   console_start_repl():   等待探测完成 → 初始化外设 → 创建REPL task
+ *                           （在app_main末尾调用，确保WiFi日志洪峰已过）
  *
- * UART:
- *   同步初始化 UART0, 需外接 USB-UART 转换器
- *
- * REPL task (console_repl_task):
- *   linenoise 阻塞读 stdin → esp_console_run() → 执行命令
- *   dumb mode (无转义序列), 适配嵌入式终端
- *
- * 内存安全:
- *   所有输出设 O_NONBLOCK, USB未连接时不会因TX buffer满而卡死
+ * REPL task:
+ *   linenoise dumb mode 阻塞读 stdin → esp_console_run() → 执行命令
  */
 
 #include <stdio.h>
@@ -51,6 +43,10 @@ static const char *TAG = "console";
 #define CONSOLE_REPL_PRIO             2
 
 static char s_prompt[CONSOLE_PROMPT_MAX_LEN];
+
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+static bool s_usb_ready;
+#endif
 
 extern void register_miaobox_commands(void);
 
@@ -163,34 +159,22 @@ static void console_repl_task(void *arg)
 #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
 static void usb_probe_task(void *arg)
 {
-    const char *prompt = (const char *)arg;
-    bool found = false;
+    (void)arg;
 
     for (int retry = 0; retry < 30; retry++) {   /* up to 6 s */
         uint16_t sof0 = REG_READ(USB_SERIAL_JTAG_FRAM_NUM_REG);
         vTaskDelay(pdMS_TO_TICKS(200));
         uint16_t sof1 = REG_READ(USB_SERIAL_JTAG_FRAM_NUM_REG);
         if (sof0 != sof1) {
-            found = true;
+            s_usb_ready = true;
+            ESP_LOGI(TAG, "USB detected, console will start after init sequence");
             break;
         }
     }
 
-    if (!found) {
+    if (!s_usb_ready) {
         ESP_LOGW(TAG, "USB not detected — console disabled");
-        vTaskDelete(NULL);
-        return;
     }
-
-    ESP_LOGI(TAG, "USB detected, initializing console");
-    console_peripheral_init();
-    console_library_init(NULL);
-    setup_prompt(prompt);
-    esp_console_register_help_command();
-    register_miaobox_commands();
-
-    xTaskCreate(console_repl_task, "console", CONSOLE_REPL_STACK,
-                NULL, CONSOLE_REPL_PRIO, NULL);
 
     vTaskDelete(NULL);
 }
@@ -198,19 +182,38 @@ static void usb_probe_task(void *arg)
 
 /* ---- public API ---- */
 
-void console_init(const char *prompt_str)
+void console_init(void)
 {
 #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
-    xTaskCreate(usb_probe_task, "usb_probe", 2048,
-                (void *)prompt_str, 2, NULL);
-#else
-    /* UART: init synchronously */
+    xTaskCreate(usb_probe_task, "usb_probe", 2048, NULL, 2, NULL);
+#endif
+}
+
+void console_start_repl(const char *prompt_str)
+{
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    int retry = 0;
+    while (!s_usb_ready && retry < 30) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        retry++;
+    }
+    if (!s_usb_ready) {
+        ESP_LOGW(TAG, "USB not detected, console REPL not started");
+        return;
+    }
+#endif
+
     console_peripheral_init();
     console_library_init(NULL);
     setup_prompt(prompt_str);
     esp_console_register_help_command();
     register_miaobox_commands();
-    xTaskCreate(console_repl_task, "console", CONSOLE_REPL_STACK,
+
+    BaseType_t ret = xTaskCreate(console_repl_task, "console", CONSOLE_REPL_STACK,
                 NULL, CONSOLE_REPL_PRIO, NULL);
-#endif
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create console_repl_task! ret=%d", ret);
+    } else {
+        ESP_LOGI(TAG, "console_repl_task created successfully");
+    }
 }

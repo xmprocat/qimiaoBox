@@ -35,9 +35,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+#include <malloc.h>
 #include "lvgl.h"
 #include "esp_log.h"
 #include "miaobox_net.h"
+#include "miaobox_ai.h"
+#include "esp_heap_caps.h"
 
 extern const lv_font_t lv_font_alibaba_22;
 extern const lv_font_t lv_font_alibaba_56;
@@ -57,6 +61,8 @@ static page_builder_t prev_page    = NULL;  /* 上一页，用于返回 */
 /* 前向声明 */
 static void build_main_menu_page(void);
 static void build_settings_page(void);
+static void build_cat_download_page(void);
+static void build_cat_display_page(void);
 
 /* ---- config ---- */
 #define BIRTHDAY1_MONTH  8
@@ -592,6 +598,391 @@ static void build_heart_page(void)
     ESP_LOGI(TAG, "Built heart page");
 }
 
+/* ---- page: AI cat generator ---- */
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+/* 页面固定变量 */
+static lv_obj_t *cat_wifi_label;       /* 行1: 网络连接状态 */
+static lv_obj_t *cat_ssid_label;       /* 行2: SSID + IP 信息 */
+static lv_obj_t *cat_request_label;    /* 行3: 请求猫猫状态 */
+static lv_obj_t *cat_req_err_label;    /* 行3b: 请求失败原因 */
+static lv_obj_t *cat_download_label;   /* 行4: 下载猫猫状态 */
+static lv_obj_t *cat_dl_err_label;     /* 行4b: 下载失败原因 */
+static lv_obj_t *cat_result_label;     /* 行5: 结果提示 */
+static lv_obj_t *cat_hint;             /* 底部: 长按退出 */
+static lv_timer_t *cat_poll_timer;
+static QueueHandle_t cat_evt_queue = NULL;
+
+/* AI事件队列数据结构 */
+typedef struct {
+    ai_evt_t evt;
+    char msg[64];
+} cat_queue_evt_t;
+
+/* AI模块回调 - 发送事件到队列 */
+static void cat_ai_event_cb(ai_event_data_t *data, void *user_data)
+{
+    if (!cat_evt_queue) return;
+    cat_queue_evt_t evt = { .evt = data->evt };
+    if (data->msg) strncpy(evt.msg, data->msg, sizeof(evt.msg) - 1);
+    xQueueSend(cat_evt_queue, &evt, 0);
+}
+
+/* 页面删除回调 */
+static void cat_delete_cb(lv_event_t *e)
+{
+    if (cat_poll_timer) {
+        lv_timer_del(cat_poll_timer);
+        cat_poll_timer = NULL;
+    }
+    ai_cat_stop();
+}
+
+/* 轮询定时器回调 - 每行独立更新，互不覆盖 */
+static void cat_poll_cb(lv_timer_t *timer)
+{
+    cat_queue_evt_t evt;
+
+    while (xQueueReceive(cat_evt_queue, &evt, 0) == pdTRUE) {
+        ESP_LOGI(TAG, "Cat AI event: %d - %s", evt.evt, evt.msg);
+
+        switch (evt.evt) {
+        case AI_EVT_WIFI_CONNECTING:
+            ts_start_blink(cat_wifi_label);
+            break;
+
+        case AI_EVT_WIFI_OK: {
+            ts_set_result(cat_wifi_label, "网络连接 --- 【成功】", true);
+            /* 显示 SSID + IP */
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s (%s)",
+                     net_wifi_get_ssid(), net_wifi_get_ip());
+            lv_label_set_text(cat_ssid_label, buf);
+            lv_obj_clear_flag(cat_ssid_label, LV_OBJ_FLAG_HIDDEN);
+            /* 显示请求行并闪烁 */
+            lv_obj_clear_flag(cat_request_label, LV_OBJ_FLAG_HIDDEN);
+            ts_start_blink(cat_request_label);
+            break;
+        }
+
+        case AI_EVT_WIFI_FAIL:
+            ts_set_result(cat_wifi_label, "网络连接 --- 【失败】", false);
+            lv_obj_clear_flag(cat_hint, LV_OBJ_FLAG_HIDDEN);
+            break;
+
+        case AI_EVT_REQUESTING:
+            /* 行3已经在WiFi_OK后闪烁了，这里不做额外操作 */
+            break;
+
+        case AI_EVT_DOWNLOADING:
+            ts_set_result(cat_request_label, "请求猫猫 --- 【成功】", true);
+            /* 显示下载行并闪烁 */
+            lv_obj_clear_flag(cat_download_label, LV_OBJ_FLAG_HIDDEN);
+            ts_start_blink(cat_download_label);
+            break;
+
+        case AI_EVT_IMAGE_READY: {
+            ts_set_result(cat_download_label, "下载猫猫 --- 【成功】", true);
+            lv_obj_clear_flag(cat_result_label, LV_OBJ_FLAG_HIDDEN);
+            /* 成功后延时1.5s自动跳转到显示页 */
+            lv_async_call(ts_switch_cb, (void *)build_cat_display_page);
+            break;
+        }
+
+        case AI_EVT_ERROR:
+            /* 在当前进行中的行显示失败，下方小字打印原因 */
+            if (!lv_obj_has_flag(cat_download_label, LV_OBJ_FLAG_HIDDEN)) {
+                ts_set_result(cat_download_label, "下载猫猫 --- 【失败】", false);
+                lv_label_set_text(cat_dl_err_label, evt.msg);
+                lv_obj_clear_flag(cat_dl_err_label, LV_OBJ_FLAG_HIDDEN);
+            } else if (!lv_obj_has_flag(cat_request_label, LV_OBJ_FLAG_HIDDEN)) {
+                ts_set_result(cat_request_label, "请求猫猫 --- 【失败】", false);
+                lv_label_set_text(cat_req_err_label, evt.msg);
+                lv_obj_clear_flag(cat_req_err_label, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                ts_set_result(cat_wifi_label, "网络连接 --- 【失败】", false);
+            }
+            lv_obj_clear_flag(cat_hint, LV_OBJ_FLAG_HIDDEN);
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+static void build_cat_download_page(void)
+{
+    /* 初始化AI模块（如果尚未初始化） */
+    static bool ai_initialized = false;
+    if (!ai_initialized) {
+        ai_cat_init();
+        ai_initialized = true;
+    }
+
+    /* 创建事件队列 */
+    if (!cat_evt_queue) {
+        cat_evt_queue = xQueueCreate(10, sizeof(cat_queue_evt_t));
+    }
+
+    /* ---- Title ---- */
+    lv_obj_t *title = lv_label_create(ui_scr);
+    lv_label_set_text(title, "美味猫猫生成中");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_set_style_text_color(title, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(title, &lv_font_alibaba_22, 0);
+
+    /* ---- 行1: 网络连接状态 ---- */
+    cat_wifi_label = lv_label_create(ui_scr);
+    lv_obj_add_event_cb(cat_wifi_label, cat_delete_cb, LV_EVENT_DELETE, NULL);
+    lv_label_set_text(cat_wifi_label, "网络连接 --- 【进行中】");
+    lv_obj_align(cat_wifi_label, LV_ALIGN_CENTER, 0, -36);
+    lv_obj_set_style_text_color(cat_wifi_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(cat_wifi_label, &lv_font_alibaba_22, 0);
+    ts_start_blink(cat_wifi_label);
+
+    /* ---- 行2: SSID + IP (WiFi成功后显示) ---- */
+    cat_ssid_label = lv_label_create(ui_scr);
+    lv_label_set_text(cat_ssid_label, "");
+    lv_obj_align(cat_ssid_label, LV_ALIGN_CENTER, 0, -12);
+    lv_obj_set_style_text_color(cat_ssid_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(cat_ssid_label, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(cat_ssid_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- 行3: 请求猫猫 (WiFi成功后显示) ---- */
+    cat_request_label = lv_label_create(ui_scr);
+    lv_label_set_text(cat_request_label, "请求猫猫 --- 【进行中】");
+    lv_obj_align(cat_request_label, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_set_style_text_color(cat_request_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(cat_request_label, &lv_font_alibaba_22, 0);
+    lv_obj_add_flag(cat_request_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- 行3b: 请求失败原因 (小字，失败时显示) ---- */
+    cat_req_err_label = lv_label_create(ui_scr);
+    lv_label_set_text(cat_req_err_label, "");
+    lv_obj_align(cat_req_err_label, LV_ALIGN_CENTER, 0, 26);
+    lv_obj_set_style_text_color(cat_req_err_label, lv_color_make(255, 100, 100), 0);
+    lv_obj_set_style_text_font(cat_req_err_label, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(cat_req_err_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- 行4: 下载猫猫 (请求成功后显示) ---- */
+    cat_download_label = lv_label_create(ui_scr);
+    lv_label_set_text(cat_download_label, "下载猫猫 --- 【进行中】");
+    lv_obj_align(cat_download_label, LV_ALIGN_CENTER, 0, 44);
+    lv_obj_set_style_text_color(cat_download_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(cat_download_label, &lv_font_alibaba_22, 0);
+    lv_obj_add_flag(cat_download_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- 行4b: 下载失败原因 (小字，失败时显示) ---- */
+    cat_dl_err_label = lv_label_create(ui_scr);
+    lv_label_set_text(cat_dl_err_label, "");
+    lv_obj_align(cat_dl_err_label, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_set_style_text_color(cat_dl_err_label, lv_color_make(255, 100, 100), 0);
+    lv_obj_set_style_text_font(cat_dl_err_label, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(cat_dl_err_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- 行5: 结果 (全部成功后显示) ---- */
+    cat_result_label = lv_label_create(ui_scr);
+    lv_label_set_text(cat_result_label, "猫猫已生成！");
+    lv_obj_align(cat_result_label, LV_ALIGN_CENTER, 0, 80);
+    lv_obj_set_style_text_color(cat_result_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_font(cat_result_label, &lv_font_alibaba_22, 0);
+    lv_obj_add_flag(cat_result_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- 底部提示 (失败时显示) ---- */
+    cat_hint = lv_label_create(ui_scr);
+    lv_label_set_text(cat_hint, "<---长按退出");
+    lv_obj_align(cat_hint, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+    lv_obj_set_style_text_color(cat_hint, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(cat_hint, &lv_font_alibaba_22, 0);
+    lv_obj_add_flag(cat_hint, LV_OBJ_FLAG_HIDDEN);
+
+    lv_anim_t ha;
+    lv_anim_init(&ha);
+    lv_anim_set_var(&ha, cat_hint);
+    lv_anim_set_exec_cb(&ha, fade_in_cb);
+    lv_anim_set_values(&ha, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&ha, 1500);
+    lv_anim_set_playback_duration(&ha, 1500);
+    lv_anim_set_repeat_count(&ha, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&ha);
+
+    /* ---- 轮询定时器 ---- */
+    cat_poll_timer = lv_timer_create(cat_poll_cb, 200, NULL);
+
+    /* ---- 检查AI配置 ---- */
+    if (!ai_cat_check_config()) {
+        /* 配置缺失，显示错误 */
+        ts_set_result(cat_wifi_label, "配置缺失 --- 【请设置】", false);
+        if (cat_req_err_label) lv_label_set_text(cat_req_err_label, "setcfg ai.workspace");
+        if (cat_dl_err_label) lv_label_set_text(cat_dl_err_label, "setcfg ai.apikey");
+        ESP_LOGW(TAG, "AI config not set, skip start");
+    } else {
+        /* ---- 启动AI任务 ---- */
+        ai_cat_start(cat_ai_event_cb, NULL);
+    }
+
+    ESP_LOGI(TAG, "Built cat page");
+}
+
+/* ---- page: cat image display (PNGdec逐行解码) ---- */
+
+#include "PNGdec.h"
+
+#define IMG_W_MAX 200
+#define IMG_H_MAX 200
+#define TFT_W 240
+#define TFT_H 240
+
+static lv_image_dsc_t cat_disp_dsc;
+static bool cat_disp_row_filled[IMG_H_MAX];
+static uint16_t *cat_disp_rgb565;
+static PNGIMAGE cat_disp_png;  /* 静态BSS, 不占堆 */
+static int cat_img_w, cat_img_h; /* 实际使用的图片尺寸(运行时确定) */
+
+static void cat_disp_delete_cb(lv_event_t *e)
+{
+    if (cat_disp_rgb565) { free(cat_disp_rgb565); cat_disp_rgb565 = NULL; }
+}
+
+/* PNGdec逐行回调 */
+static int cat_disp_draw_cb(PNGDRAW *pDraw)
+{
+    int y = pDraw->y;
+    int png_w = pDraw->iWidth;
+    int png_h = PNG_getHeight(&cat_disp_png);
+    int sbps = pDraw->iPitch / png_w;
+    int out_y = (int)((uint64_t)y * cat_img_h / png_h);
+
+    if (out_y < 0 || out_y >= cat_img_h) return 1;
+    cat_disp_row_filled[out_y] = true;
+
+    for (int x = 0; x < cat_img_w; x++) {
+        int sx = (int)((uint64_t)x * png_w / cat_img_w);
+        uint8_t *src = &pDraw->pPixels[sx * sbps];
+        uint8_t r, g, b;
+        switch (pDraw->iPixelType) {
+        case PNG_PIXEL_TRUECOLOR:
+            r = src[0]; g = src[1]; b = src[2]; break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            r = src[0]; g = src[1]; b = src[2]; break;
+        case PNG_PIXEL_GRAYSCALE:
+            r = g = b = src[0]; break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            r = g = b = src[0]; break;
+        case PNG_PIXEL_INDEXED:
+            { uint8_t *pal = &pDraw->pPalette[src[0] * 3];
+              r = pal[0]; g = pal[1]; b = pal[2]; } break;
+        default:
+            r = g = b = src[0]; break;
+        }
+        cat_disp_rgb565[out_y * cat_img_w + x] =
+            ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    }
+    return 1;
+}
+
+static void build_cat_display_page(void)
+{
+    if (!ai_cat_verify_image()) goto disp_fail_no_unmap;
+
+    size_t png_size = 0;
+    esp_partition_mmap_handle_t png_handle = 0;
+    const uint8_t *png_data = ai_cat_map_image(&png_size, &png_handle);
+    if (!png_data) goto disp_fail_no_unmap;
+
+    /* 回收下载残留的TLS/WiFi碎片 */
+    malloc_trim(0);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "after-trim heap=%u, largest=%u",
+             (unsigned)esp_get_free_heap_size(), (unsigned)largest);
+
+    /* 根据最大连续块动态决定图片尺寸, 留4KB余量 */
+    size_t avail = (largest > 4096) ? largest - 4096 : 0;
+    int max_side = (int)sqrt((double)avail / 2);
+    if (max_side > IMG_W_MAX) max_side = IMG_W_MAX;
+    if (max_side < 80) {
+        ESP_LOGE(TAG, "largest block too small: %u", (unsigned)largest);
+        goto disp_fail_unmap;
+    }
+    cat_img_w = cat_img_h = max_side;
+    ESP_LOGI(TAG, "image size: %dx%d (%u bytes)", cat_img_w, cat_img_h, cat_img_w * cat_img_h * 2);
+
+    cat_disp_rgb565 = malloc(cat_img_w * cat_img_h * 2);
+    if (!cat_disp_rgb565) {
+        ESP_LOGE(TAG, "OOM for %dx%d", cat_img_w, cat_img_h);
+        goto disp_fail_unmap;
+    }
+    memset(&cat_disp_png, 0, sizeof(cat_disp_png));
+    memset(cat_disp_rgb565, 0, cat_img_w * cat_img_h * 2);
+    memset(cat_disp_row_filled, 0, sizeof(cat_disp_row_filled));
+
+    /* PNGdec逐行解码 */
+    int rc = PNG_openRAM(&cat_disp_png, (uint8_t *)png_data, png_size, cat_disp_draw_cb);
+    if (rc == PNG_SUCCESS) {
+        rc = PNG_decode(&cat_disp_png, &cat_disp_png, 0);
+    }
+    PNG_close(&cat_disp_png);
+    esp_partition_munmap(png_handle);
+
+    if (rc != PNG_SUCCESS) {
+        ESP_LOGE(TAG, "PNGdec err: %d", rc);
+        goto disp_fail_unmap;
+    }
+    ESP_LOGI(TAG, "PNGdec done, heap=%u", (unsigned)esp_get_free_heap_size());
+
+    /* 填充未覆盖的行 */
+    for (int y = 1; y < cat_img_h; y++) {
+        if (!cat_disp_row_filled[y])
+            memcpy(&cat_disp_rgb565[y * cat_img_w],
+                   &cat_disp_rgb565[(y - 1) * cat_img_w], cat_img_w * 2);
+    }
+
+    /* === 构建LVGL UI === */
+    {
+        memset(&cat_disp_dsc, 0, sizeof(cat_disp_dsc));
+        cat_disp_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        cat_disp_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        cat_disp_dsc.header.w = cat_img_w;
+        cat_disp_dsc.header.h = cat_img_h;
+        cat_disp_dsc.data = (const uint8_t *)cat_disp_rgb565;
+        cat_disp_dsc.data_size = cat_img_w * cat_img_h * 2;
+
+        lv_obj_t *img = lv_image_create(ui_scr);
+        lv_obj_add_event_cb(img, cat_disp_delete_cb, LV_EVENT_DELETE, NULL);
+        lv_image_set_src(img, &cat_disp_dsc);
+        lv_obj_set_size(img, cat_img_w, cat_img_h);
+        lv_obj_center(img);
+
+        lv_obj_t *hint = lv_label_create(ui_scr);
+        lv_label_set_text(hint, "<---长按退出");
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+        lv_obj_set_style_text_color(hint, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_text_font(hint, &lv_font_alibaba_22, 0);
+    }
+    ESP_LOGI(TAG, "Built cat display page (%dx%d)", cat_img_w, cat_img_h);
+    return;
+
+disp_fail_unmap:
+    esp_partition_munmap(png_handle);
+    if (cat_disp_rgb565) { free(cat_disp_rgb565); cat_disp_rgb565 = NULL; }
+disp_fail_no_unmap:
+    {
+        lv_obj_t *s = lv_label_create(ui_scr);
+        lv_label_set_text(s, "No image");
+        lv_obj_align(s, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_color(s, lv_color_make(255, 100, 100), 0);
+        lv_obj_set_style_text_font(s, &lv_font_alibaba_22, 0);
+        lv_obj_t *hint = lv_label_create(ui_scr);
+        lv_label_set_text(hint, "<---长按退出");
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+        lv_obj_set_style_text_color(hint, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_text_font(hint, &lv_font_alibaba_22, 0);
+    }
+}
+
 /* ================================================================
  *  主菜单页面 (main menu page)
  * ================================================================
@@ -623,9 +1014,9 @@ typedef struct {
 static const menu_entry_t menu_entries[MENU_COUNT] = {
     {"设置",  build_settings_page,  &icon_setting },  /* 0 */
     {"淇",    build_birthday_page, NULL          },  /* 1 */
-    {"喵",    NULL,                NULL          },  /* 2 */
+    {"喵",    build_cat_download_page, NULL     },  /* 2 */
     {"保留1", build_heart_page,    &icon_default },  /* 3 */
-    {"保留2", NULL,                &icon_default },  /* 4 */
+    {"保留2", build_cat_display_page, &icon_default },  /* 4 */
     {"调试",  build_key_test_page, &icon_debug   },  /* 5 */
 };
 
@@ -874,7 +1265,8 @@ static void settings_add_row(lv_obj_t *parent, const char *text,
     lv_obj_t *dd = lv_dropdown_create(parent);
     lv_dropdown_set_options(dd, options);
     lv_dropdown_set_selected(dd, selected);
-    lv_dropdown_set_symbol(dd, "");                /* 去掉 LV_SYMBOL_DOWN (缺字体) */
+    /* 隐藏dropdown的箭头symbol */
+    lv_obj_set_style_bg_opa(dd, 0, LV_PART_INDICATOR);
     lv_obj_set_pos(dd, 115, y - 4);
     lv_obj_set_size(dd, 95, 34);
 
